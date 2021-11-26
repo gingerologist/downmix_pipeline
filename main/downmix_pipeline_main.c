@@ -30,10 +30,10 @@ static const char *TAG = "DOWNMIX_PIPELINE_EXAMPLE";
 #define INDEX_BASE_STREAM 0
 #define INDEX_NEWCOME_STREAM 1
 #define SAMPLERATE 48000
-#define NUM_INPUT_CHANNEL 1
+#define NUM_INPUT_CHANNEL 2
 #define TRANSMITTIME 500
 #define MUSIC_GAIN_DB 0
-#define PLAY_STATUS ESP_DOWNMIX_OUTPUT_TYPE_ONE_CHANNEL
+#define PLAY_STATUS ESP_DOWNMIX_OUTPUT_TYPE_TWO_CHANNEL
 #define NUMBER_SOURCE_FILE 2
 
 void app_main(void)
@@ -128,13 +128,13 @@ void app_main(void)
     rsp_sdcard_cfg.src_rate = 44100,
     rsp_sdcard_cfg.src_ch = 2,
     rsp_sdcard_cfg.dest_rate = 48000,
-    rsp_sdcard_cfg.dest_ch = 1,
+    rsp_sdcard_cfg.dest_ch = 2,
     base_rsp_filter_el = rsp_filter_init(&rsp_sdcard_cfg);
 
     rsp_sdcard_cfg.src_rate = 16000,
     rsp_sdcard_cfg.src_ch = 1,
     rsp_sdcard_cfg.dest_rate = 48000,
-    rsp_sdcard_cfg.dest_ch = 1,
+    rsp_sdcard_cfg.dest_ch = 2,
     newcome_rsp_filter_el = rsp_filter_init(&rsp_sdcard_cfg);
 
     ESP_LOGI(TAG, "[4.2] Create raw stream of base mp3 to write data");
@@ -177,6 +177,7 @@ void app_main(void)
     audio_pipeline_set_listener(pipeline_mix, evt);
     audio_event_iface_set_listener(esp_periph_set_get_event_iface(set), evt);
     downmix_set_output_type(downmixer, PLAY_STATUS);
+    downmix_set_out_ctx_info(downmixer, ESP_DOWNMIX_OUT_CTX_NORMAL);
     i2s_stream_set_clk(i2s_writer, SAMPLERATE, 16, PLAY_STATUS);
 
     audio_pipeline_run(base_stream_pipeline);
