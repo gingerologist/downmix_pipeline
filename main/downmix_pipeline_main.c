@@ -36,39 +36,26 @@ static const char *TAG = "DOWNMIX_PIPELINE_EXAMPLE";
 #define PLAY_STATUS ESP_DOWNMIX_OUTPUT_TYPE_TWO_CHANNEL
 #define NUMBER_SOURCE_FILE 2
 
-void app_main(void) {
-    audio_element_handle_t base_fatfs_reader_el = NULL;
-    audio_element_handle_t base_mp3_decoder_el = NULL;
-    audio_element_handle_t base_rsp_filter_el = NULL;
-    audio_element_handle_t base_raw_write_el = NULL;
+static audio_element_handle_t base_fatfs_reader_el = NULL;
+static audio_element_handle_t base_mp3_decoder_el = NULL;
+static audio_element_handle_t base_rsp_filter_el = NULL;
+static audio_element_handle_t base_raw_write_el = NULL;
 
-    audio_element_handle_t newcome_fatfs_reader_el = NULL;
-    audio_element_handle_t newcome_mp3_decoder_el = NULL;
-    audio_element_handle_t newcome_rsp_filter_el = NULL;
-    audio_element_handle_t newcome_raw_write_el = NULL;
+static audio_element_handle_t newcome_fatfs_reader_el = NULL;
+static audio_element_handle_t newcome_mp3_decoder_el = NULL;
+static audio_element_handle_t newcome_rsp_filter_el = NULL;
+static audio_element_handle_t newcome_raw_write_el = NULL;
 
-    esp_log_level_set("*", ESP_LOG_WARN);
-    esp_log_level_set(TAG, ESP_LOG_INFO);
+static audio_element_handle_t downmixer = NULL;
+static audio_element_handle_t i2s_writer = NULL;
 
-    ESP_LOGI(TAG, "[1.0] Start audio codec chip");
-    audio_board_handle_t board_handle = audio_board_init();
-    audio_hal_ctrl_codec(board_handle->audio_hal, AUDIO_HAL_CODEC_MODE_DECODE,
-                         AUDIO_HAL_CTRL_START);
+static audio_pipeline_handle_t pipeline_mix = NULL;
 
-    ESP_LOGI(TAG, "[2.0] Start and wait for SDCARD to mount");
-    esp_periph_config_t periph_cfg = DEFAULT_ESP_PERIPH_SET_CONFIG();
-    esp_periph_set_handle_t set = esp_periph_set_init(&periph_cfg);
-    audio_board_sdcard_init(set, SD_MODE_1_LINE);
-    audio_board_key_init(set);
-
-    ESP_LOGI(TAG, "[3.0] Create pipeline_mix pipeline");
-    audio_pipeline_cfg_t pipeline_cfg = DEFAULT_AUDIO_PIPELINE_CONFIG();
-    audio_pipeline_handle_t pipeline_mix = audio_pipeline_init(&pipeline_cfg);
-
+static void create_mixer() {
     ESP_LOGI(TAG, "[3.1] Create down-mixer element");
     downmix_cfg_t downmix_cfg = DEFAULT_DOWNMIX_CONFIG();
     downmix_cfg.downmix_info.source_num = NUMBER_SOURCE_FILE;
-    audio_element_handle_t downmixer = downmix_init(&downmix_cfg);
+    downmixer = downmix_init(&downmix_cfg);
     downmix_set_input_rb_timeout(downmixer, 0, INDEX_BASE_STREAM);
     downmix_set_input_rb_timeout(downmixer, 0, INDEX_NEWCOME_STREAM);
 
@@ -93,11 +80,17 @@ void app_main(void) {
     };
     source_information[1] = source_info_newcome;
     source_info_init(downmixer, source_information);
+}
 
+void create_mixout_pipeline () {
     ESP_LOGI(TAG, "[3.2] Create i2s stream to read audio data from codec chip");
     i2s_stream_cfg_t i2s_cfg = I2S_STREAM_CFG_DEFAULT();
     i2s_cfg.type = AUDIO_STREAM_WRITER;
-    audio_element_handle_t i2s_writer = i2s_stream_init(&i2s_cfg);
+    i2s_writer = i2s_stream_init(&i2s_cfg);
+
+    ESP_LOGI(TAG, "[3.0] Create pipeline_mix pipeline");
+    audio_pipeline_cfg_t pipeline_cfg = DEFAULT_AUDIO_PIPELINE_CONFIG();
+    pipeline_mix = audio_pipeline_init(&pipeline_cfg);
 
     ESP_LOGI(TAG, "[3.3] Link elements together downmixer-->i2s_writer");
     audio_pipeline_register(pipeline_mix, downmixer, "mixer");
@@ -108,6 +101,25 @@ void app_main(void) {
         "[3.4] Link elements together downmixer-->i2s_stream-->[codec_chip]");
     const char *link_mix[2] = {"mixer", "i2s"};
     audio_pipeline_link(pipeline_mix, &link_mix[0], 2);
+}
+
+void app_main(void) {
+    esp_log_level_set("*", ESP_LOG_WARN);
+    esp_log_level_set(TAG, ESP_LOG_INFO);
+
+    ESP_LOGI(TAG, "[1.0] Start audio codec chip");
+    audio_board_handle_t board_handle = audio_board_init();
+    audio_hal_ctrl_codec(board_handle->audio_hal, AUDIO_HAL_CODEC_MODE_DECODE,
+                         AUDIO_HAL_CTRL_START);
+
+    ESP_LOGI(TAG, "[2.0] Start and wait for SDCARD to mount");
+    esp_periph_config_t periph_cfg = DEFAULT_ESP_PERIPH_SET_CONFIG();
+    esp_periph_set_handle_t set = esp_periph_set_init(&periph_cfg);
+    audio_board_sdcard_init(set, SD_MODE_1_LINE);
+    audio_board_key_init(set);
+
+    create_mixer();
+    create_mixout_pipeline();
 
     ESP_LOGI(TAG, "[4.0] Create Fatfs stream to read input data");
     fatfs_stream_cfg_t fatfs_cfg = FATFS_STREAM_CFG_DEFAULT();
@@ -142,6 +154,7 @@ void app_main(void) {
     audio_event_iface_cfg_t evt_cfg = AUDIO_EVENT_IFACE_DEFAULT_CFG();
     audio_event_iface_handle_t evt = audio_event_iface_init(&evt_cfg);
 
+    audio_pipeline_cfg_t pipeline_cfg = DEFAULT_AUDIO_PIPELINE_CONFIG();
     audio_pipeline_handle_t base_stream_pipeline =
         audio_pipeline_init(&pipeline_cfg);
     mem_assert(base_stream_pipeline);
@@ -192,6 +205,7 @@ void app_main(void) {
     audio_pipeline_run(base_stream_pipeline);
     audio_pipeline_run(pipeline_mix);
     downmix_set_work_mode(downmixer, ESP_DOWNMIX_WORK_MODE_BYPASS);
+
     ESP_LOGI(TAG, "[6.0] Base stream pipeline running");
     while (1) {
         audio_event_iface_msg_t msg;
