@@ -25,82 +25,257 @@
 #include "periph_sdcard.h"
 #include "periph_button.h"
 
-static const char *TAG = "DOWNMIX_PIPELINE_EXAMPLE";
+static const char *TAG = "MIX";
 
-#define INDEX_BASE_STREAM 0
-#define INDEX_NEWCOME_STREAM 1
-#define SAMPLERATE 48000
-#define NUM_INPUT_CHANNEL 2
-#define TRANSMITTIME 500
+#define INPUT1_INDEX 0
+#define INPUT2_INDEX 1
+#define SAMPLE_RATE 48000
+#define BITS_PER_SAMPLE 16
+#define NUM_OF_INPUT_CHANNEL 2
+
+#define TRANSITION 1000
 #define MUSIC_GAIN_DB 0
-#define PLAY_STATUS ESP_DOWNMIX_OUTPUT_TYPE_TWO_CHANNEL
-#define NUMBER_SOURCE_FILE 2
+#define NUM_OF_INPUTS 2
 
-static audio_element_handle_t base_fatfs_reader_el = NULL;
-static audio_element_handle_t base_mp3_decoder_el = NULL;
-static audio_element_handle_t base_rsp_filter_el = NULL;
-static audio_element_handle_t base_raw_write_el = NULL;
+static esp_periph_set_handle_t set = NULL;
 
-static audio_element_handle_t newcome_fatfs_reader_el = NULL;
-static audio_element_handle_t newcome_mp3_decoder_el = NULL;
-static audio_element_handle_t newcome_rsp_filter_el = NULL;
-static audio_element_handle_t newcome_raw_write_el = NULL;
+static audio_element_handle_t fat[NUM_OF_INPUTS] = {};
+static audio_element_handle_t dec[NUM_OF_INPUTS] = {};
+static audio_element_handle_t rsp[NUM_OF_INPUTS] = {};
+static audio_element_handle_t raw[NUM_OF_INPUTS] = {};
+static audio_pipeline_handle_t input[NUM_OF_INPUTS] = {};
 
-static audio_element_handle_t downmixer = NULL;
-static audio_element_handle_t i2s_writer = NULL;
+static bool running[NUM_OF_INPUTS] = {};
+static bool output_running = false;
+static bool destroying = false;
 
-static audio_pipeline_handle_t pipeline_mix = NULL;
+static audio_element_handle_t mixer = NULL;
+static audio_element_handle_t writer = NULL;
+static audio_pipeline_handle_t output = NULL;
 
-static void create_mixer() {
-    ESP_LOGI(TAG, "[3.1] Create down-mixer element");
-    downmix_cfg_t downmix_cfg = DEFAULT_DOWNMIX_CONFIG();
-    downmix_cfg.downmix_info.source_num = NUMBER_SOURCE_FILE;
-    downmixer = downmix_init(&downmix_cfg);
-    downmix_set_input_rb_timeout(downmixer, 0, INDEX_BASE_STREAM);
-    downmix_set_input_rb_timeout(downmixer, 0, INDEX_NEWCOME_STREAM);
+static audio_event_iface_handle_t evt = NULL;
 
-    esp_downmix_input_info_t source_information[NUMBER_SOURCE_FILE] = {0};
-    esp_downmix_input_info_t source_info_base = {
-        .samplerate = SAMPLERATE,
-        .channel = NUM_INPUT_CHANNEL,
-        .bits_num = 16,
-        /* base music depress form 0dB to -10dB */
-        .gain = {0, -10},
-        .transit_time = TRANSMITTIME,
-    };
-    source_information[0] = source_info_base;
+static void setup_input(int i) {
+    fatfs_stream_cfg_t fatfs_cfg = FATFS_STREAM_CFG_DEFAULT();
+    fatfs_cfg.type = AUDIO_STREAM_READER;
+    fat[i] = fatfs_stream_init(&fatfs_cfg);
 
-    esp_downmix_input_info_t source_info_newcome = {
-        .samplerate = SAMPLERATE,
-        .channel = NUM_INPUT_CHANNEL,
-        .bits_num = 16,
-        /* newcome music rise form -10dB to 0dB */
-        .gain = {-10, 0},
-        .transit_time = TRANSMITTIME,
-    };
-    source_information[1] = source_info_newcome;
-    source_info_init(downmixer, source_information);
+    mp3_decoder_cfg_t mp3_cfg = DEFAULT_MP3_DECODER_CONFIG();
+    mp3_cfg.out_rb_size = (16 * 1024);
+    mp3_cfg.task_core = 1;
+    mp3_cfg.stack_in_ext = false;
+    dec[i] = mp3_decoder_init(&mp3_cfg);
+
+    rsp_filter_cfg_t rsp_cfg = DEFAULT_RESAMPLE_FILTER_CONFIG();
+    rsp_cfg.src_rate = 48000;
+    rsp_cfg.src_ch = 2;
+    rsp_cfg.dest_rate = 48000;
+    rsp_cfg.dest_ch = 2;
+    rsp_cfg.task_core = 1;
+    rsp_cfg.out_rb_size = (16 * 1024);
+    rsp[i] = rsp_filter_init(&rsp_cfg);
+
+    raw_stream_cfg_t raw_cfg = RAW_STREAM_CFG_DEFAULT();
+    raw_cfg.type = AUDIO_STREAM_WRITER;
+    raw_cfg.out_rb_size = (16 * 1024);
+    raw[i] = raw_stream_init(&raw_cfg);
+
+    audio_pipeline_cfg_t pipeline_cfg = DEFAULT_AUDIO_PIPELINE_CONFIG();
+    input[i] = audio_pipeline_init(&pipeline_cfg);
+    mem_assert(input[i]);
+    audio_pipeline_register(input[i], fat[i], "fat");
+    audio_pipeline_register(input[i], dec[i], "dec");
+    audio_pipeline_register(input[i], rsp[i], "rsp");
+    audio_pipeline_register(input[i], raw[i], "raw");
+
+    const char *tags[4] = {"fat", "dec", "rsp", "raw"};
+    audio_pipeline_link(input[i], &tags[0], 4);
 }
 
-void create_mixout_pipeline () {
-    ESP_LOGI(TAG, "[3.2] Create i2s stream to read audio data from codec chip");
+static void setup_mixer() {
+    ESP_LOGI(TAG, "[ ? ] Setup Mixer");
+    downmix_cfg_t cfg = DEFAULT_DOWNMIX_CONFIG();
+    cfg.downmix_info.source_num = NUM_OF_INPUTS;
+    audio_element_handle_t mx = downmix_init(&cfg);
+
+    esp_downmix_input_info_t source_info[NUM_OF_INPUTS] = {};
+    for (int i = 0; i < NUM_OF_INPUTS; i++) {
+        if (i == 0) {
+            esp_downmix_input_info_t info = {
+                .samplerate = SAMPLE_RATE,
+                .channel = NUM_OF_INPUT_CHANNEL,
+                .bits_num = BITS_PER_SAMPLE,
+                .gain = {0, -20},
+                .transit_time = TRANSITION,
+            };
+            source_info[i] = info;
+        } else {
+            esp_downmix_input_info_t info = {
+                .samplerate = SAMPLE_RATE,
+                .channel = NUM_OF_INPUT_CHANNEL,
+                .bits_num = BITS_PER_SAMPLE,
+                .gain = {-20, 0},
+                .transit_time = TRANSITION,
+            };
+            source_info[i] = info;
+        }
+    }
+
+    // TODO there are other apis to do this
+    source_info_init(mx, source_info);
+
+    for (int i = 0; i < NUM_OF_INPUTS; i++) {
+        downmix_set_input_rb(mx, audio_element_get_input_ringbuf(raw[i]), i);
+        downmix_set_input_rb_timeout(mx, 0, i);
+    }
+
+    downmix_set_output_type(mx, ESP_DOWNMIX_OUTPUT_TYPE_TWO_CHANNEL);
+    downmix_set_out_ctx_info(mx, ESP_DOWNMIX_OUT_CTX_NORMAL);
+    mixer = mx;
+}
+
+static void setup_output() {
+    ESP_LOGI(TAG, "[ * ] Setup Output Pipeline");
     i2s_stream_cfg_t i2s_cfg = I2S_STREAM_CFG_DEFAULT();
     i2s_cfg.type = AUDIO_STREAM_WRITER;
-    i2s_writer = i2s_stream_init(&i2s_cfg);
+    writer = i2s_stream_init(&i2s_cfg);
+    i2s_stream_set_clk(writer, SAMPLE_RATE, BITS_PER_SAMPLE,
+                       ESP_DOWNMIX_OUTPUT_TYPE_TWO_CHANNEL);
 
-    ESP_LOGI(TAG, "[3.0] Create pipeline_mix pipeline");
-    audio_pipeline_cfg_t pipeline_cfg = DEFAULT_AUDIO_PIPELINE_CONFIG();
-    pipeline_mix = audio_pipeline_init(&pipeline_cfg);
+    audio_pipeline_cfg_t ppl_cfg = DEFAULT_AUDIO_PIPELINE_CONFIG();
+    output = audio_pipeline_init(&ppl_cfg);
 
-    ESP_LOGI(TAG, "[3.3] Link elements together downmixer-->i2s_writer");
-    audio_pipeline_register(pipeline_mix, downmixer, "mixer");
-    audio_pipeline_register(pipeline_mix, i2s_writer, "i2s");
+    audio_pipeline_register(output, mixer, "mixer");
+    audio_pipeline_register(output, writer, "i2s");
 
-    ESP_LOGI(
-        TAG,
-        "[3.4] Link elements together downmixer-->i2s_stream-->[codec_chip]");
-    const char *link_mix[2] = {"mixer", "i2s"};
-    audio_pipeline_link(pipeline_mix, &link_mix[0], 2);
+    const char *tags[2] = {"mixer", "i2s"};
+    audio_pipeline_link(output, &tags[0], 2);
+}
+
+static void setup_listeners() {
+    ESP_LOGI(TAG, "[ * ] Setup Listeners");
+    audio_event_iface_cfg_t evt_cfg = AUDIO_EVENT_IFACE_DEFAULT_CFG();
+    evt = audio_event_iface_init(&evt_cfg);
+    for (int i = 0; i < NUM_OF_INPUTS; i++) {
+        audio_pipeline_set_listener(input[i], evt);
+    }
+    audio_pipeline_set_listener(output, evt);
+    audio_event_iface_set_listener(esp_periph_set_get_event_iface(set), evt);
+}
+
+static void switch_mode (bool b) {
+    if (b) {
+        downmix_set_work_mode(mixer, ESP_DOWNMIX_WORK_MODE_SWITCH_ON);
+        ESP_LOGI(TAG, "fg switched on");
+    } else {
+        downmix_set_work_mode(mixer, ESP_DOWNMIX_WORK_MODE_SWITCH_OFF);
+        ESP_LOGI(TAG, "fg switched off");
+    }
+}
+
+static void run_output() {
+    if (!output_running) {
+        audio_pipeline_reset_ringbuffer(output);
+        audio_pipeline_reset_elements(output);
+        audio_pipeline_change_state(output, AEL_STATE_INIT);
+        audio_pipeline_run(output);
+        output_running = true;
+    }
+}
+
+static void handle_ae_finished(void *src) {
+    if (src == mixer) {
+        ESP_LOGI(TAG, "mixer finished");
+    } else  if (src == writer) {
+        ESP_LOGI(TAG, "writer finished");
+        output_running = false;
+    } else {
+        for (int i = 0; i < NUM_OF_INPUTS; i++) {
+            if (src == fat[i]) {
+                ESP_LOGI(TAG, "fat %d finished", i);
+                return;
+            } else if (src == dec[i]) {
+                ESP_LOGI(TAG, "dec %d finished", i);
+                return;
+            } else if (src == rsp[i]) {
+                ESP_LOGI(TAG, "rsp %d finished", i);
+                running[i] = false;
+                if (i == 1)
+                    switch_mode(false);
+                return;
+            } else if (src == raw[i]) {
+                ESP_LOGI(TAG, "raw %d finished", i);
+                return;
+            }
+        }
+    }
+}
+
+static void handle_ae_stopped(void *src) {
+    if (src == mixer) {
+        ESP_LOGI(TAG, "mixer stopped");
+    } else  if (src == writer) {
+        ESP_LOGI(TAG, "writer stopped");
+    } else {
+        for (int i = 0; i < NUM_OF_INPUTS; i++) {
+            if (src == fat[i]) {
+                ESP_LOGI(TAG, "fat %d stopped", i);
+                return;
+            } else if (src == dec[i]) {
+                ESP_LOGI(TAG, "dec %d stopped", i);
+                return;
+            } else if (src == rsp[i]) {
+                ESP_LOGI(TAG, "rsp %d stopped", i);
+                return;
+            } else if (src == raw[i]) {
+                ESP_LOGI(TAG, "raw %d stopped", i);
+                return;
+            }
+        }
+    }
+}
+
+static void handle_rec_button() {
+    const int i = 0;
+    ESP_LOGI(TAG, "rec button pressed (input %d)", i);
+    if (running[i]) {
+        ESP_LOGI(TAG, "input %d running", i);
+        return;
+    }
+
+    audio_element_set_uri(fat[i], "/sdcard/fall.mp3");
+    audio_pipeline_reset_ringbuffer(input[i]);
+    audio_pipeline_reset_elements(input[i]); 
+    audio_pipeline_change_state(input[i], AEL_STATE_INIT);
+    audio_pipeline_run(input[i]);
+    running[i] = true;
+    run_output();
+}
+
+static void handle_mode_button() {
+    const int i = 1;
+    ESP_LOGI(TAG, "mode button pressed (input %d)", i);
+    if (running[i]) {
+        ESP_LOGI(TAG, "input %d running", i);
+        return;
+    }
+
+    audio_element_set_uri(fat[i], "/sdcard/nangong.mp3");
+    audio_pipeline_reset_ringbuffer(input[i]);
+    audio_pipeline_reset_elements(input[i]); 
+    audio_pipeline_change_state(input[i], AEL_STATE_INIT);
+    audio_pipeline_run(input[i]);
+    switch_mode(true);
+    running[i] = true;
+    run_output();
+}
+
+static void handle_play_button() {
+    ESP_LOGI(TAG, "play button pressed");
+}
+
+static void handle_set_button() {
+    ESP_LOGI(TAG, "set button pressed");
 }
 
 void app_main(void) {
@@ -114,181 +289,109 @@ void app_main(void) {
 
     ESP_LOGI(TAG, "[2.0] Start and wait for SDCARD to mount");
     esp_periph_config_t periph_cfg = DEFAULT_ESP_PERIPH_SET_CONFIG();
-    esp_periph_set_handle_t set = esp_periph_set_init(&periph_cfg);
+    set = esp_periph_set_init(&periph_cfg);
     audio_board_sdcard_init(set, SD_MODE_1_LINE);
     audio_board_key_init(set);
 
-    create_mixer();
-    create_mixout_pipeline();
+    for (int i = 0; i < NUM_OF_INPUTS; i++) {
+        setup_input(i);
+    }
+    setup_mixer();
+    setup_output();
+    setup_listeners();
+    switch_mode(false);
+    audio_pipeline_run(output);
 
-    ESP_LOGI(TAG, "[4.0] Create Fatfs stream to read input data");
-    fatfs_stream_cfg_t fatfs_cfg = FATFS_STREAM_CFG_DEFAULT();
-    fatfs_cfg.type = AUDIO_STREAM_READER;
-    base_fatfs_reader_el = fatfs_stream_init(&fatfs_cfg);
-    audio_element_set_uri(base_fatfs_reader_el, "/sdcard/music.mp3");
-    newcome_fatfs_reader_el = fatfs_stream_init(&fatfs_cfg);
-    audio_element_set_uri(newcome_fatfs_reader_el, "/sdcard/tone.mp3");
-
-    ESP_LOGI(TAG, "[4.1] Create mp3 decoder to decode mp3 file");
-    mp3_decoder_cfg_t mp3_cfg = DEFAULT_MP3_DECODER_CONFIG();
-    base_mp3_decoder_el = mp3_decoder_init(&mp3_cfg);
-    newcome_mp3_decoder_el = mp3_decoder_init(&mp3_cfg);
-
-    ESP_LOGI(TAG, "[4.1] Create resample element");
-    rsp_filter_cfg_t rsp_sdcard_cfg = DEFAULT_RESAMPLE_FILTER_CONFIG();
-    rsp_sdcard_cfg.src_rate = 44100, rsp_sdcard_cfg.src_ch = 2,
-    rsp_sdcard_cfg.dest_rate = 48000, rsp_sdcard_cfg.dest_ch = 2,
-    base_rsp_filter_el = rsp_filter_init(&rsp_sdcard_cfg);
-
-    rsp_sdcard_cfg.src_rate = 16000, rsp_sdcard_cfg.src_ch = 1,
-    rsp_sdcard_cfg.dest_rate = 48000, rsp_sdcard_cfg.dest_ch = 2,
-    newcome_rsp_filter_el = rsp_filter_init(&rsp_sdcard_cfg);
-
-    ESP_LOGI(TAG, "[4.2] Create raw stream of base mp3 to write data");
-    raw_stream_cfg_t raw_cfg = RAW_STREAM_CFG_DEFAULT();
-    raw_cfg.type = AUDIO_STREAM_WRITER;
-    base_raw_write_el = raw_stream_init(&raw_cfg);
-    newcome_raw_write_el = raw_stream_init(&raw_cfg);
-
-    ESP_LOGI(TAG, "[5.0] Set up  event listener");
-    audio_event_iface_cfg_t evt_cfg = AUDIO_EVENT_IFACE_DEFAULT_CFG();
-    audio_event_iface_handle_t evt = audio_event_iface_init(&evt_cfg);
-
-    audio_pipeline_cfg_t pipeline_cfg = DEFAULT_AUDIO_PIPELINE_CONFIG();
-    audio_pipeline_handle_t base_stream_pipeline =
-        audio_pipeline_init(&pipeline_cfg);
-    mem_assert(base_stream_pipeline);
-    audio_pipeline_register(base_stream_pipeline, base_fatfs_reader_el,
-                            "base_file");
-    audio_pipeline_register(base_stream_pipeline, base_mp3_decoder_el,
-                            "base_mp3");
-    audio_pipeline_register(base_stream_pipeline, base_rsp_filter_el,
-                            "base_filter");
-    audio_pipeline_register(base_stream_pipeline, base_raw_write_el,
-                            "base_raw");
-
-    const char *link_tag_base[4] = {"base_file", "base_mp3", "base_filter",
-                                    "base_raw"};
-    audio_pipeline_link(base_stream_pipeline, &link_tag_base[0], 4);
-    ringbuf_handle_t rb_base =
-        audio_element_get_input_ringbuf(base_raw_write_el);
-    downmix_set_input_rb(downmixer, rb_base, 0);
-    audio_pipeline_set_listener(base_stream_pipeline, evt);
-
-    audio_pipeline_handle_t newcome_stream_pipeline =
-        audio_pipeline_init(&pipeline_cfg);
-    mem_assert(newcome_stream_pipeline);
-    audio_pipeline_register(newcome_stream_pipeline, newcome_fatfs_reader_el,
-                            "newcome_file");
-    audio_pipeline_register(newcome_stream_pipeline, newcome_mp3_decoder_el,
-                            "newcome_mp3");
-    audio_pipeline_register(newcome_stream_pipeline, newcome_rsp_filter_el,
-                            "newcome_filter");
-    audio_pipeline_register(newcome_stream_pipeline, newcome_raw_write_el,
-                            "newcome_raw");
-
-    const char *link_tag_newcome[4] = {"newcome_file", "newcome_mp3",
-                                       "newcome_filter", "newcome_raw"};
-    audio_pipeline_link(newcome_stream_pipeline, &link_tag_newcome[0], 4);
-    ringbuf_handle_t rb_newcome =
-        audio_element_get_input_ringbuf(newcome_raw_write_el);
-    downmix_set_input_rb(downmixer, rb_newcome, 1);
-    audio_pipeline_set_listener(newcome_stream_pipeline, evt);
-
-    ESP_LOGI(TAG, "[5.1] Listening event from peripherals");
-    audio_pipeline_set_listener(pipeline_mix, evt);
-    audio_event_iface_set_listener(esp_periph_set_get_event_iface(set), evt);
-    downmix_set_output_type(downmixer, PLAY_STATUS);
-    downmix_set_out_ctx_info(downmixer, ESP_DOWNMIX_OUT_CTX_NORMAL);
-    i2s_stream_set_clk(i2s_writer, SAMPLERATE, 16, PLAY_STATUS);
-
-    audio_pipeline_run(base_stream_pipeline);
-    audio_pipeline_run(pipeline_mix);
-    downmix_set_work_mode(downmixer, ESP_DOWNMIX_WORK_MODE_BYPASS);
-
-    ESP_LOGI(TAG, "[6.0] Base stream pipeline running");
     while (1) {
         audio_event_iface_msg_t msg;
+
         esp_err_t ret = audio_event_iface_listen(evt, &msg, portMAX_DELAY);
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "[ * ] Event interface error : %d", ret);
             continue;
         }
 
-        /* When the mode button pressed, the downmix pipeline switch on */
-        if (((int)msg.data == get_input_mode_id()) &&
-            (msg.cmd == PERIPH_BUTTON_PRESSED)) {
-            audio_pipeline_run(newcome_stream_pipeline);
-            downmix_set_work_mode(downmixer, ESP_DOWNMIX_WORK_MODE_SWITCH_ON);
-            downmix_set_input_rb_timeout(downmixer, 50, INDEX_BASE_STREAM);
-            downmix_set_input_rb_timeout(downmixer, 50, INDEX_NEWCOME_STREAM);
-            ESP_LOGI(TAG, "New come music running...");
+        /* set src info on-the-fly */
+        if (msg.source_type == AUDIO_ELEMENT_TYPE_ELEMENT &&
+            msg.cmd == AEL_MSG_CMD_REPORT_MUSIC_INFO) {
+            for (int i = 0; i < NUM_OF_INPUTS; i++) {
+                if (msg.source == (void *)dec[i]) {
+                    audio_element_info_t fi = {}, di = {};
+                    audio_element_getinfo(fat[i], &fi); 
+                    audio_element_getinfo(dec[i], &di);
+                    rsp_filter_set_src_info(rsp[i], di.sample_rates,
+                                            di.channels);
+                    ESP_LOGI(TAG,
+                             "[ * ] play: %s, "
+                             "sample rates: %d, bits: %d, ch: %d @ input %d",
+                             fi.uri, di.sample_rates, di.bits, di.channels, i);
+                }
+            }
         }
 
-        /* Stop when the last pipeline element i2s_writer receives stop event */
-        if (msg.source_type == AUDIO_ELEMENT_TYPE_ELEMENT &&
-            msg.source == (void *)i2s_writer &&
-            msg.cmd == AEL_MSG_CMD_REPORT_STATUS &&
-            (((int)msg.data == AEL_STATUS_STATE_STOPPED) ||
-             ((int)msg.data == AEL_STATUS_STATE_FINISHED))) {
-            ESP_LOGW(TAG, "Player finsihed, break loop");
-            break;
+        /* handle button event */
+        if (msg.cmd == PERIPH_BUTTON_PRESSED) {
+            int id = (int)msg.data;
+            if (id == get_input_rec_id()) {
+                handle_rec_button();
+            } else if (id == get_input_mode_id()) {
+                handle_mode_button();
+            } else if (id == get_input_play_id()) {
+                handle_play_button();
+            } else if (id == get_input_set_id()) {
+                handle_set_button();
+            }
+            continue;
         }
 
-        /* Stop when the last pipeline element receives stop event */
+        /* handle finished event */
         if (msg.source_type == AUDIO_ELEMENT_TYPE_ELEMENT &&
-            msg.source == (void *)newcome_rsp_filter_el &&
             msg.cmd == AEL_MSG_CMD_REPORT_STATUS &&
-            (((int)msg.data == AEL_STATUS_STATE_STOPPED) ||
-             ((int)msg.data == AEL_STATUS_STATE_FINISHED))) {
-            downmix_set_work_mode(downmixer, ESP_DOWNMIX_WORK_MODE_SWITCH_OFF);
-            downmix_set_input_rb_timeout(downmixer, 0, INDEX_BASE_STREAM);
-            downmix_set_input_rb_timeout(downmixer, 0, INDEX_NEWCOME_STREAM);
-            audio_pipeline_stop(newcome_stream_pipeline);
-            audio_pipeline_wait_for_stop(newcome_stream_pipeline);
-            audio_pipeline_terminate(newcome_stream_pipeline);
-            audio_pipeline_reset_ringbuffer(newcome_stream_pipeline);
-            audio_pipeline_reset_elements(newcome_stream_pipeline);
-            ESP_LOGI(TAG, "New come music stoped or finsihed");
+            (int)msg.data == AEL_STATUS_STATE_FINISHED) {
+            handle_ae_finished((void *)msg.source);
+        }
+
+        /* handle stopped event */
+        if (msg.source_type == AUDIO_ELEMENT_TYPE_ELEMENT &&
+            msg.cmd == AEL_MSG_CMD_REPORT_STATUS &&
+            (int)msg.data == AEL_STATUS_STATE_STOPPED) {
+            handle_ae_stopped((void *)msg.source);
         }
     }
 
     ESP_LOGI(TAG, "[7.0] Stop all pipelines");
     /* Stop base stream pipeline, Release resources */
-    audio_pipeline_stop(base_stream_pipeline);
-    audio_pipeline_wait_for_stop(base_stream_pipeline);
-    audio_pipeline_terminate(base_stream_pipeline);
-    audio_pipeline_unregister_more(base_stream_pipeline, base_fatfs_reader_el,
-                                   base_mp3_decoder_el, base_rsp_filter_el,
-                                   base_raw_write_el, NULL);
-    audio_pipeline_remove_listener(base_stream_pipeline);
-    audio_pipeline_deinit(base_stream_pipeline);
-    audio_element_deinit(base_fatfs_reader_el);
-    audio_element_deinit(base_mp3_decoder_el);
-    audio_element_deinit(base_rsp_filter_el);
-    audio_element_deinit(base_raw_write_el);
+    audio_pipeline_stop(input[0]);
+    audio_pipeline_wait_for_stop(input[0]);
+    audio_pipeline_terminate(input[0]);
+    audio_pipeline_unregister_more(input[0], fat[0], dec[0], rsp[0],
+                                   raw[0], NULL);
+    audio_pipeline_remove_listener(input[0]);
+    audio_pipeline_deinit(input[0]);
+    audio_element_deinit(fat[0]);
+    audio_element_deinit(dec[0]);
+    audio_element_deinit(rsp[0]);
+    audio_element_deinit(raw[0]);
 
     /* Stop newcome stream pipeline, Release resources */
-    audio_pipeline_stop(newcome_stream_pipeline);
-    audio_pipeline_wait_for_stop(newcome_stream_pipeline);
-    audio_pipeline_terminate(newcome_stream_pipeline);
-    audio_pipeline_unregister_more(
-        newcome_stream_pipeline, newcome_fatfs_reader_el,
-        newcome_mp3_decoder_el, newcome_rsp_filter_el, newcome_raw_write_el,
-        NULL);
-    audio_pipeline_remove_listener(newcome_stream_pipeline);
-    audio_pipeline_deinit(newcome_stream_pipeline);
-    audio_element_deinit(newcome_fatfs_reader_el);
-    audio_element_deinit(newcome_mp3_decoder_el);
-    audio_element_deinit(newcome_rsp_filter_el);
-    audio_element_deinit(newcome_raw_write_el);
+    audio_pipeline_stop(input[1]);
+    audio_pipeline_wait_for_stop(input[1]);
+    audio_pipeline_terminate(input[1]);
+    audio_pipeline_unregister_more(input[1], fat[1], dec[1], rsp[1],
+                                   raw[1], NULL);
+    audio_pipeline_remove_listener(input[1]);
+    audio_pipeline_deinit(input[1]);
+    audio_element_deinit(fat[1]);
+    audio_element_deinit(dec[1]);
+    audio_element_deinit(rsp[1]);
+    audio_element_deinit(raw[1]);
 
     /* Stop mixer stream pipeline, Release resources */
-    audio_pipeline_stop(pipeline_mix);
-    audio_pipeline_wait_for_stop(pipeline_mix);
-    audio_pipeline_terminate(pipeline_mix);
-    audio_pipeline_unregister_more(pipeline_mix, downmixer, i2s_writer, NULL);
-    audio_pipeline_remove_listener(pipeline_mix);
+    audio_pipeline_stop(output);
+    audio_pipeline_wait_for_stop(output);
+    audio_pipeline_terminate(output);
+    audio_pipeline_unregister_more(output, mixer, writer, NULL);
+    audio_pipeline_remove_listener(output);
 
     /* Stop all peripherals before removing the listener */
     esp_periph_set_stop_all(set);
@@ -300,8 +403,8 @@ void app_main(void) {
     audio_event_iface_destroy(evt);
 
     /* Release resources */
-    audio_pipeline_deinit(pipeline_mix);
-    audio_element_deinit(downmixer);
-    audio_element_deinit(i2s_writer);
+    audio_pipeline_deinit(output);
+    audio_element_deinit(mixer);
+    audio_element_deinit(writer);
     esp_periph_set_destroy(set);
 }
