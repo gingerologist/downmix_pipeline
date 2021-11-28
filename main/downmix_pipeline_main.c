@@ -173,6 +173,13 @@ static void switch_mode (bool b) {
     }
 }
 
+static void reset_input(int i) {
+    audio_pipeline_reset_ringbuffer(input[i]);
+    audio_pipeline_reset_elements(input[i]); 
+    audio_pipeline_change_state(input[i], AEL_STATE_INIT);
+}
+
+/**
 static void run_output() {
     if (!output_running) {
         audio_pipeline_reset_ringbuffer(output);
@@ -181,14 +188,14 @@ static void run_output() {
         audio_pipeline_run(output);
         output_running = true;
     }
-}
+} */
 
-static void handle_ae_finished(void *src) {
+static void handle_audio_element_finished(void *src) {
     if (src == mixer) {
         ESP_LOGI(TAG, "mixer finished");
     } else  if (src == writer) {
         ESP_LOGI(TAG, "writer finished");
-        output_running = false;
+        // output_running = false;
     } else {
         for (int i = 0; i < NUM_OF_INPUTS; i++) {
             if (src == fat[i]) {
@@ -199,6 +206,7 @@ static void handle_ae_finished(void *src) {
                 return;
             } else if (src == rsp[i]) {
                 ESP_LOGI(TAG, "rsp %d finished", i);
+                reset_input(i);
                 running[i] = false;
                 if (i == 1)
                     switch_mode(false);
@@ -211,7 +219,7 @@ static void handle_ae_finished(void *src) {
     }
 }
 
-static void handle_ae_stopped(void *src) {
+static void handle_audio_element_stopped(void *src) {
     if (src == mixer) {
         ESP_LOGI(TAG, "mixer stopped");
     } else  if (src == writer) {
@@ -244,12 +252,14 @@ static void handle_rec_button() {
     }
 
     audio_element_set_uri(fat[i], "/sdcard/fall.mp3");
+/**
     audio_pipeline_reset_ringbuffer(input[i]);
     audio_pipeline_reset_elements(input[i]); 
     audio_pipeline_change_state(input[i], AEL_STATE_INIT);
+*/
     audio_pipeline_run(input[i]);
     running[i] = true;
-    run_output();
+    // run_output();
 }
 
 static void handle_mode_button() {
@@ -261,13 +271,15 @@ static void handle_mode_button() {
     }
 
     audio_element_set_uri(fat[i], "/sdcard/nangong.mp3");
+/**
     audio_pipeline_reset_ringbuffer(input[i]);
     audio_pipeline_reset_elements(input[i]); 
     audio_pipeline_change_state(input[i], AEL_STATE_INIT);
+*/
     audio_pipeline_run(input[i]);
     switch_mode(true);
     running[i] = true;
-    run_output();
+    // run_output();
 }
 
 static void handle_play_button() {
@@ -301,6 +313,7 @@ void app_main(void) {
     setup_listeners();
     switch_mode(false);
     audio_pipeline_run(output);
+    output_running = true;
 
     while (1) {
         audio_event_iface_msg_t msg;
@@ -348,14 +361,14 @@ void app_main(void) {
         if (msg.source_type == AUDIO_ELEMENT_TYPE_ELEMENT &&
             msg.cmd == AEL_MSG_CMD_REPORT_STATUS &&
             (int)msg.data == AEL_STATUS_STATE_FINISHED) {
-            handle_ae_finished((void *)msg.source);
+            handle_audio_element_finished((void *)msg.source);
         }
 
         /* handle stopped event */
         if (msg.source_type == AUDIO_ELEMENT_TYPE_ELEMENT &&
             msg.cmd == AEL_MSG_CMD_REPORT_STATUS &&
             (int)msg.data == AEL_STATUS_STATE_STOPPED) {
-            handle_ae_stopped((void *)msg.source);
+            handle_audio_element_stopped((void *)msg.source);
         }
     }
 
