@@ -46,7 +46,6 @@ static audio_element_handle_t raw[NUM_OF_INPUTS] = {};
 static audio_pipeline_handle_t input[NUM_OF_INPUTS] = {};
 
 static bool running[NUM_OF_INPUTS] = {};
-static bool output_running = false;
 static bool destroying = false;
 
 static audio_element_handle_t mixer = NULL;
@@ -163,13 +162,26 @@ static void setup_listeners() {
     audio_event_iface_set_listener(esp_periph_set_get_event_iface(set), evt);
 }
 
-static void switch_mode (bool b) {
-    if (b) {
+static void switch_mode (bool mode) {
+    if (mode) {
         downmix_set_work_mode(mixer, ESP_DOWNMIX_WORK_MODE_SWITCH_ON);
         ESP_LOGI(TAG, "fg switched on");
     } else {
         downmix_set_work_mode(mixer, ESP_DOWNMIX_WORK_MODE_SWITCH_OFF);
         ESP_LOGI(TAG, "fg switched off");
+    }
+}
+
+static void run_input(int i, const char * uri) {
+    if (running[i]) {
+        ESP_LOGI(TAG, "input %d running", i);
+        return;
+    }
+    audio_element_set_uri(fat[i], uri);
+    audio_pipeline_run(input[i]);
+    running[i] = true;
+    if (i == 1) {
+        switch_mode(true);
     }
 }
 
@@ -179,23 +191,11 @@ static void reset_input(int i) {
     audio_pipeline_change_state(input[i], AEL_STATE_INIT);
 }
 
-/**
-static void run_output() {
-    if (!output_running) {
-        audio_pipeline_reset_ringbuffer(output);
-        audio_pipeline_reset_elements(output);
-        audio_pipeline_change_state(output, AEL_STATE_INIT);
-        audio_pipeline_run(output);
-        output_running = true;
-    }
-} */
-
 static void handle_audio_element_finished(void *src) {
     if (src == mixer) {
         ESP_LOGI(TAG, "mixer finished");
     } else  if (src == writer) {
         ESP_LOGI(TAG, "writer finished");
-        // output_running = false;
     } else {
         for (int i = 0; i < NUM_OF_INPUTS; i++) {
             if (src == fat[i]) {
@@ -217,69 +217,6 @@ static void handle_audio_element_finished(void *src) {
             }
         }
     }
-}
-
-static void handle_audio_element_stopped(void *src) {
-    if (src == mixer) {
-        ESP_LOGI(TAG, "mixer stopped");
-    } else  if (src == writer) {
-        ESP_LOGI(TAG, "writer stopped");
-    } else {
-        for (int i = 0; i < NUM_OF_INPUTS; i++) {
-            if (src == fat[i]) {
-                ESP_LOGI(TAG, "fat %d stopped", i);
-                return;
-            } else if (src == dec[i]) {
-                ESP_LOGI(TAG, "dec %d stopped", i);
-                return;
-            } else if (src == rsp[i]) {
-                ESP_LOGI(TAG, "rsp %d stopped", i);
-                return;
-            } else if (src == raw[i]) {
-                ESP_LOGI(TAG, "raw %d stopped", i);
-                return;
-            }
-        }
-    }
-}
-
-static void handle_rec_button() {
-    const int i = 0;
-    ESP_LOGI(TAG, "rec button pressed (input %d)", i);
-    if (running[i]) {
-        ESP_LOGI(TAG, "input %d running", i);
-        return;
-    }
-
-    audio_element_set_uri(fat[i], "/sdcard/fall.mp3");
-/**
-    audio_pipeline_reset_ringbuffer(input[i]);
-    audio_pipeline_reset_elements(input[i]); 
-    audio_pipeline_change_state(input[i], AEL_STATE_INIT);
-*/
-    audio_pipeline_run(input[i]);
-    running[i] = true;
-    // run_output();
-}
-
-static void handle_mode_button() {
-    const int i = 1;
-    ESP_LOGI(TAG, "mode button pressed (input %d)", i);
-    if (running[i]) {
-        ESP_LOGI(TAG, "input %d running", i);
-        return;
-    }
-
-    audio_element_set_uri(fat[i], "/sdcard/nangong.mp3");
-/**
-    audio_pipeline_reset_ringbuffer(input[i]);
-    audio_pipeline_reset_elements(input[i]); 
-    audio_pipeline_change_state(input[i], AEL_STATE_INIT);
-*/
-    audio_pipeline_run(input[i]);
-    switch_mode(true);
-    running[i] = true;
-    // run_output();
 }
 
 static void handle_play_button() {
@@ -313,7 +250,6 @@ void app_main(void) {
     setup_listeners();
     switch_mode(false);
     audio_pipeline_run(output);
-    output_running = true;
 
     while (1) {
         audio_event_iface_msg_t msg;
@@ -346,13 +282,13 @@ void app_main(void) {
         if (msg.cmd == PERIPH_BUTTON_PRESSED) {
             int id = (int)msg.data;
             if (id == get_input_rec_id()) {
-                handle_rec_button();
+                run_input(1, "/sdcard/monster.mp3");
             } else if (id == get_input_mode_id()) {
-                handle_mode_button();
+                run_input(1, "/sdcard/nangong.mp3");
             } else if (id == get_input_play_id()) {
-                handle_play_button();
+                run_input(0, "/sdcard/fall.mp3");
             } else if (id == get_input_set_id()) {
-                handle_set_button();
+                run_input(0, "/sdcard/battle.mp3");
             }
             continue;
         }
@@ -362,13 +298,6 @@ void app_main(void) {
             msg.cmd == AEL_MSG_CMD_REPORT_STATUS &&
             (int)msg.data == AEL_STATUS_STATE_FINISHED) {
             handle_audio_element_finished((void *)msg.source);
-        }
-
-        /* handle stopped event */
-        if (msg.source_type == AUDIO_ELEMENT_TYPE_ELEMENT &&
-            msg.cmd == AEL_MSG_CMD_REPORT_STATUS &&
-            (int)msg.data == AEL_STATUS_STATE_STOPPED) {
-            handle_audio_element_stopped((void *)msg.source);
         }
     }
 
