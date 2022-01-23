@@ -11,7 +11,13 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
+
 #include "esp_log.h"
+#include "esp_wifi.h"
+#include "esp_system.h"
+#include "esp_event.h"
+#include "nvs_flash.h"
+
 #include "audio_element.h"
 #include "audio_pipeline.h"
 #include "audio_event_iface.h"
@@ -25,19 +31,41 @@
 #include "periph_sdcard.h"
 #include "periph_button.h"
 
+/**
+esp_err_t esp_periph_send_event(esp_periph_handle_t periph, int event_id,
+                                void *data, int data_len) {
+    if (periph->on_evt == NULL) {
+        return ESP_FAIL;
+    }
+    audio_event_iface_msg_t msg;
+    msg.source_type = periph->periph_id;
+    msg.cmd = event_id;
+    msg.data = data;
+    msg.data_len = data_len;
+    msg.need_free_data = false;
+    msg.source = periph;
+
+    if (periph->on_evt->cb) {
+        periph->on_evt->cb(&msg, periph->on_evt->user_ctx);
+    }
+    return audio_event_iface_sendout(periph->on_evt->iface, &msg);
+} */
+
 static const char *TAG = "MIX";
 
-#define INPUT1_INDEX 0
-#define INPUT2_INDEX 1
+#define NUM_OF_INPUTS 2
 #define SAMPLE_RATE 48000
 #define BITS_PER_SAMPLE 16
 #define NUM_OF_INPUT_CHANNEL 2
-
 #define TRANSITION 1000
-#define MUSIC_GAIN_DB 0
-#define NUM_OF_INPUTS 2
+
+static char softap_ssid[32] = "JubenshaGateway";
+static char softap_pass[32] = {};
 
 static esp_periph_set_handle_t set = NULL;
+
+static esp_event_handler_instance_t instance_any_id;
+static esp_event_handler_instance_t instance_got_ip;
 
 static audio_element_handle_t fat[NUM_OF_INPUTS] = {};
 static audio_element_handle_t dec[NUM_OF_INPUTS] = {};
@@ -165,10 +193,10 @@ static void setup_listeners() {
 static void switch_mode (bool mode) {
     if (mode) {
         downmix_set_work_mode(mixer, ESP_DOWNMIX_WORK_MODE_SWITCH_ON);
-        ESP_LOGI(TAG, "fg switched on");
+        ESP_LOGI(TAG, "foreground sound entering");
     } else {
         downmix_set_work_mode(mixer, ESP_DOWNMIX_WORK_MODE_SWITCH_OFF);
-        ESP_LOGI(TAG, "fg switched off");
+        ESP_LOGI(TAG, "foreground sound leaving");
     }
 }
 
@@ -219,17 +247,83 @@ static void handle_audio_element_finished(void *src) {
     }
 }
 
-static void handle_play_button() {
-    ESP_LOGI(TAG, "play button pressed");
+static void wifi_event_handler(void *arg, esp_event_base_t event_base,
+                               int32_t event_id, void *event_data) {
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+        ESP_LOGI(TAG, "connecting to ap");
+    } else if (event_base == WIFI_EVENT &&
+               event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        esp_wifi_connect();
+        ESP_LOGI(TAG, "reconnecting to ap");
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) { 
+        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
+        ESP_LOGI(TAG, "got ip:" IPSTR, IP2STR(&event->ip_info.ip));
+    }
 }
 
-static void handle_set_button() {
-    ESP_LOGI(TAG, "set button pressed");
+static void setup_wifi() {
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    esp_netif_t *sta_netif = esp_netif_create_default_wifi_sta();
+    assert(sta_netif);
+
+    esp_netif_t *ap_netif = esp_netif_create_default_wifi_ap();
+    assert(ap_netif);
+
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(
+        WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL,
+        &instance_any_id));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(
+        IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL,
+        &instance_got_ip));
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+
+    wifi_config_t cfg1 = {
+        .sta =
+            {
+                .ssid = "juwanke",
+                .password = "juwanke!",
+                .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+                .pmf_cfg = {.capable = true, .required = false},
+            },
+    };
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &cfg1));
+
+    wifi_config_t cfg2 = {
+        .ap =
+            {
+                .ssid = "",
+                .ssid_len = 0,
+                .max_connection = 8,
+                .authmode = WIFI_AUTH_OPEN,
+            },
+    };
+
+    /* sizeof ap.ssid is 32 */
+    strlcpy((char *)cfg2.ap.ssid, softap_ssid, sizeof(cfg2.ap.ssid));
+    cfg2.ap.ssid_len = strlen(softap_ssid);
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &cfg2));
+    ESP_ERROR_CHECK(esp_wifi_start());
 }
 
 void app_main(void) {
     esp_log_level_set("*", ESP_LOG_WARN);
     esp_log_level_set(TAG, ESP_LOG_INFO);
+
+    esp_err_t ret;
+
+    ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES
+		|| ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK( ret );
 
     ESP_LOGI(TAG, "[1.0] Start audio codec chip");
     audio_board_handle_t board_handle = audio_board_init();
@@ -241,6 +335,8 @@ void app_main(void) {
     set = esp_periph_set_init(&periph_cfg);
     audio_board_sdcard_init(set, SD_MODE_1_LINE);
     audio_board_key_init(set);
+
+    setup_wifi();
 
     for (int i = 0; i < NUM_OF_INPUTS; i++) {
         setup_input(i);
